@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { message } from "@tauri-apps/plugin-dialog";
+import { ask, message } from "@tauri-apps/plugin-dialog";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { Sidebar } from "./chrome/Sidebar";
 import { ApprovalToasts } from "./chrome/ApprovalToasts";
@@ -22,7 +22,7 @@ import {
 import { IS_MAC } from "./lib/platform";
 import { runUpdateFlow } from "./lib/updater";
 import { displayAttachments, prepareAttachments } from "./lib/attachments";
-import { basename, notifyGitChanged, pickFolder, restoreSessionCheckout } from "./lib/fs";
+import { basename, notifyGitChanged, pickFolder, restoreSessionCheckout, type GitHistoryCommit } from "./lib/fs";
 import {
   invalidateProjectFiles,
   prefetchProjectFiles,
@@ -36,6 +36,7 @@ import {
   focusedFileTab,
   isolateTerminalPanes,
   isFilesystemTab,
+  isCommitTab,
   isTerminalTab,
   leaf,
   leafIds,
@@ -48,7 +49,9 @@ import {
   newTerminalWorkspaceTab,
   nextTerminalTitle,
   openChangesTab,
+  openCommitTab,
   openEditorTab,
+  openSessionChangesTab,
   openTerminalTab,
   removePane,
   replaceLeafId,
@@ -69,7 +72,7 @@ import {
   releaseNotesForVersion,
   releaseNotesTitle,
 } from "./lib/releaseNotes";
-import { orderByIds } from "./lib/reorder";
+import { mergeOrderedSubset, orderByIds } from "./lib/reorder";
 import {
   addTerminalToDock,
   applyDockGridStyle,
@@ -144,6 +147,7 @@ import {
   sessionChildHarnesses,
   sessionThroughTurn,
   shouldAskOutgoingAgent,
+  type HandoffComposerCard,
   userMessagesAfterHandoff,
   wrapHandoffPrompt,
 } from "./lib/handoff";
@@ -152,9 +156,10 @@ import { isEditTool } from "./lib/harness/preview";
 import {
   beginSessionTurn,
   captureSessionCheckpoint,
+  flushSessionCheckpoint,
   keepSessionChanges,
   notifyReviewChanged,
-  syncSessionCheckpoint,
+  prepareSessionCheckpoint,
 } from "./lib/checkpoint";
 import { notifyDirsChanged } from "./lib/fileTree";
 import { nudgeWatchedFiles } from "./lib/fileWatch";
@@ -209,6 +214,11 @@ import {
   type SecondOpinionMeta,
   type Session,
 } from "./lib/session";
+import {
+  canDispatchQueuedHead,
+  dequeueQueuedMessage,
+  queuedMessageForSubmit,
+} from "./lib/messageQueue";
 import { dropContextWindow } from "./lib/contextUsage";
 import {
   deleteSession,
@@ -277,11 +287,13 @@ import {
   loadLiveAgentsEnabled,
   loadNotesEnabled,
   loadDiffViewer,
+  loadFollowUpBehavior,
   loadSettingsSection,
   saveSettingsSection,
   subscribeLiveAgentsEnabled,
   subscribeNotesEnabled,
   type SettingsSectionId,
+  type FollowUpBehavior,
 } from "./lib/settings";
 import {
   handleEditorFindKey,
@@ -385,6 +397,11 @@ function openSessionIds(tabs: WorkspaceTab[]): Set<string> {
     for (const id of leafIds(tab.layout)) ids.add(id);
   }
   return ids;
+}
+
+/** Native sheet. `window.confirm` is swallowed when a macOS menu accelerator fires. */
+function confirmDiscardUnsaved(message: string): Promise<boolean> {
+  return ask(message, { title: "MonoCode", kind: "warning" });
 }
 
 function titleTabsEqual(a: TitleTab[], b: TitleTab[]): boolean {
@@ -550,8 +567,11 @@ export default function App({
 
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
+  const queueDispatchingRef = useRef(new Set<string>());
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
+  const dirtyFilesRef = useRef(dirtyFiles);
+  dirtyFilesRef.current = dirtyFiles;
   const projectTerminalsRef = useRef(projectTerminals);
   projectTerminalsRef.current = projectTerminals;
   const projectTerminalFocusedRef = useRef(projectTerminalFocused);
@@ -1684,14 +1704,12 @@ export default function App({
         ...(closing.terminalPanes ?? []).flatMap((pane) => pane.files),
       ];
       const unsaved = closingFiles.filter(
-        (file) => isFilesystemTab(file) && dirtyFiles.has(file.id),
+        (file) => isFilesystemTab(file) && dirtyFilesRef.current.has(file.id),
       );
-      if (
-        unsaved.length > 0 &&
-        !window.confirm("Close this tab with unsaved files?")
-      ) {
-        return;
-      }
+      const confirmed = new Set(opts?.confirmedTerminalIds ?? []);
+      const terminals = closingFiles.filter(
+        (file) => file.terminal && !confirmed.has(file.id),
+      );
 
       const finishClose = () => {
         const nextActiveTabId = closePlan.nextActiveTabId;
@@ -1716,25 +1734,82 @@ export default function App({
         void refreshHistory(sidebarCwd);
       };
 
-      const confirmed = new Set(opts?.confirmedTerminalIds ?? []);
-      const terminals = closingFiles.filter(
-        (file) => file.terminal && !confirmed.has(file.id),
+      void (async () => {
+        if (unsaved.length > 0) {
+          const ok = await confirmDiscardUnsaved(
+            "Close this tab with unsaved files?",
+          );
+          if (!ok) return;
+        }
+        if (terminals.length > 0) {
+          const ok = await confirmCloseTerminals(terminals);
+          if (!ok) return;
+        }
+        finishClose();
+      })();
+    },
+    [activateTab, persistSession, refreshHistory, sidebarCwd, tabCloseScope],
+  );
+
+  const onCloseOtherTabs = useCallback(() => {
+    const current = tabsRef.current;
+    const activeId = activeTabIdRef.current;
+    const closing = current.filter((tab) => tab.id !== activeId);
+    if (
+      !current.some((tab) => tab.id === activeId) ||
+      closing.length === 0
+    ) {
+      return;
+    }
+
+    const closingIds = new Set(closing.map((tab) => tab.id));
+    const closingFiles = closing.flatMap((tab) => [
+      ...tab.editorPanes.flatMap((pane) => pane.files),
+      ...(tab.terminalPanes ?? []).flatMap((pane) => pane.files),
+    ]);
+    const unsaved = closingFiles.filter(
+      (file) => isFilesystemTab(file) && dirtyFilesRef.current.has(file.id),
+    );
+    const terminals = closingFiles.filter((file) => file.terminal);
+
+    const finishClose = () => {
+      const sessionIds = new Set(
+        closing.flatMap((tab) =>
+          leafIds(tab.layout).filter((paneId) =>
+            sessionsRef.current.some((session) => session.id === paneId),
+          ),
+        ),
       );
+      for (const sessionId of sessionIds) {
+        persistSession(
+          sessionsRef.current.find((session) => session.id === sessionId),
+        );
+      }
+      setDirtyFiles((prev) => {
+        const next = new Set(prev);
+        for (const file of closingFiles) next.delete(file.id);
+        return next;
+      });
+      setTabs((prev) =>
+        prev.filter((tab) => tab.id === activeId || !closingIds.has(tab.id)),
+      );
+      void refreshHistory(sidebarCwd);
+    };
+
+    void (async () => {
+      if (unsaved.length > 0) {
+        const ok = await confirmDiscardUnsaved(
+          "Close other tabs with unsaved files?",
+        );
+        if (!ok) return;
+      }
       if (terminals.length > 0) {
-        void confirmCloseTerminals(terminals).then((ok) => ok && finishClose());
-        return;
+        const ok = await confirmCloseTerminals(terminals);
+        if (!ok) return;
       }
       finishClose();
-    },
-    [
-      dirtyFiles,
-      activateTab,
-      persistSession,
-      refreshHistory,
-      sidebarCwd,
-      tabCloseScope,
-    ],
-  );
+    })();
+  }, [persistSession, refreshHistory, sidebarCwd]);
 
   const onCloseFile = useCallback(
     (paneId: string, fileId: string) => {
@@ -1748,13 +1823,8 @@ export default function App({
       const index = pane.files.findIndex((file) => file.id === fileId);
       if (index < 0) return;
       const file = pane.files[index];
-      if (
-        isFilesystemTab(file) &&
-        dirtyFiles.has(fileId) &&
-        !window.confirm(`Close ${basename(file.path)} without saving?`)
-      ) {
-        return;
-      }
+      const needsUnsavedConfirm =
+        isFilesystemTab(file) && dirtyFilesRef.current.has(fileId);
 
       const finishClose = () => {
         const files = pane.files.filter((entry) => entry.id !== fileId);
@@ -1854,13 +1924,21 @@ export default function App({
         }
       };
 
-      if (file.terminal) {
-        void confirmCloseTerminal(file).then((ok) => ok && finishClose());
-        return;
-      }
-      finishClose();
+      void (async () => {
+        if (needsUnsavedConfirm) {
+          const ok = await confirmDiscardUnsaved(
+            `Close ${basename(file.path)} without saving?`,
+          );
+          if (!ok) return;
+        }
+        if (file.terminal) {
+          const ok = await confirmCloseTerminal(file);
+          if (!ok) return;
+        }
+        finishClose();
+      })();
     },
-    [activeTabId, dirtyFiles, onCloseTab, projectCwd, tabCloseScope],
+    [activeTabId, onCloseTab, projectCwd, tabCloseScope],
   );
 
   const onClearTabSession = useCallback(
@@ -1873,14 +1951,8 @@ export default function App({
         ...(tab.terminalPanes ?? []).flatMap((pane) => pane.files),
       ];
       const unsaved = closingFiles.filter(
-        (file) => isFilesystemTab(file) && dirtyFiles.has(file.id),
+        (file) => isFilesystemTab(file) && dirtyFilesRef.current.has(file.id),
       );
-      if (
-        unsaved.length > 0 &&
-        !window.confirm("Close this conversation with unsaved files?")
-      ) {
-        return;
-      }
 
       const oldSessionId = leafIds(tab.layout).find((paneId) =>
         sessionsRef.current.some((session) => session.id === paneId),
@@ -1890,58 +1962,58 @@ export default function App({
       );
       if (!oldSession) return;
 
-      persistSession(oldSession);
+      const finishClear = () => {
+        persistSession(oldSession);
 
-      const session = newSession(
-        oldSession.harness,
-        oldSession.cwd,
-        oldSession.model,
-        oldSession.runtimeMode,
-        oldSession.modelSettings,
-      );
+        const session = newSession(
+          oldSession.harness,
+          oldSession.cwd,
+          oldSession.model,
+          oldSession.runtimeMode,
+          oldSession.modelSettings,
+        );
 
-      setSessions((prev) => [...prev, session]);
-      setDirtyFiles((prev) => {
-        const updated = new Set(prev);
-        for (const file of closingFiles) updated.delete(file.id);
-        return updated;
-      });
-      setTabs((prev) =>
-        prev.map((entry) =>
-          entry.id === id
-            ? {
-                ...entry,
-                layout: leaf(session.id),
-                focusedId: session.id,
-                editorPanes: [],
-                terminalPanes: [],
-                diffOpen: false,
-                diffFocused: false,
-              }
-            : entry,
-        ),
-      );
-      setComposerFocused(true);
-      void refreshHistory(sidebarCwd);
+        setSessions((prev) => [...prev, session]);
+        setDirtyFiles((prev) => {
+          const updated = new Set(prev);
+          for (const file of closingFiles) updated.delete(file.id);
+          return updated;
+        });
+        setTabs((prev) =>
+          prev.map((entry) =>
+            entry.id === id
+              ? {
+                  ...entry,
+                  layout: leaf(session.id),
+                  focusedId: session.id,
+                  editorPanes: [],
+                  terminalPanes: [],
+                  diffOpen: false,
+                  diffFocused: false,
+                }
+              : entry,
+          ),
+        );
+        setComposerFocused(true);
+        void refreshHistory(sidebarCwd);
+      };
+
+      if (unsaved.length === 0) {
+        finishClear();
+        return;
+      }
+      void confirmDiscardUnsaved(
+        "Close this conversation with unsaved files?",
+      ).then((ok) => ok && finishClear());
     },
-    [tabs, dirtyFiles, persistSession, refreshHistory, sidebarCwd],
+    [tabs, persistSession, refreshHistory, sidebarCwd],
   );
 
   const onClosePane = useCallback(
     (sessionId?: string) => {
-      if (
-        sessionId === undefined &&
-        projectTerminalFocused
-      ) {
-        const dock = findProjectTerminal(
-          projectTerminalsRef.current,
-          projectCwdRef.current,
-        );
-        if (dock) {
-          onCloseProjectTerminal(dock.pane.activeFileId);
-          return;
-        }
-      }
+      // The project terminal is shared by every workspace tab in the project.
+      // Keep the global close command scoped to workspace tabs and panes even
+      // while the dock has focus; terminal tabs have their own close buttons.
       if (!activeTab) return;
       const focusedSurface = findSurfacePane(activeTab, activeTab.focusedId);
       if (sessionId === undefined && focusedSurface) {
@@ -1987,11 +2059,9 @@ export default function App({
     [
       activeTab,
       onCloseFile,
-      onCloseProjectTerminal,
       onCloseTab,
       onClearTabSession,
       persistSession,
-      projectTerminalFocused,
       refreshHistory,
       sidebarCwd,
       tabCloseScope,
@@ -2080,15 +2150,24 @@ export default function App({
   );
 
   const onOpenDiff = useCallback(
-    (path?: string) => {
+    (path?: string, session?: { sessionId: string; cwd: string }) => {
       void (async () => {
+        const diffCwd = session?.cwd ?? gitCwdRef.current;
         const resolved = path
-          ? ((await resolveOpenablePath(gitCwdRef.current, path)) ?? path)
+          ? ((await resolveOpenablePath(diffCwd, path)) ?? path)
           : undefined;
-        if (resolved) rememberOpenedFile(sidebarCwdRef.current, resolved);
+        if (resolved) rememberOpenedFile(diffCwd, resolved);
         setTabs((prev) =>
           prev.map((tab) => {
             if (tab.id !== activeTabId) return tab;
+            if (session) {
+              return openSessionChangesTab(
+                tab,
+                session.cwd,
+                session.sessionId,
+                resolved,
+              );
+            }
             if (loadDiffViewer() === "unified") {
               return openChangesTab(tab, sidebarCwdRef.current, resolved);
             }
@@ -2106,6 +2185,24 @@ export default function App({
     [activeTabId],
   );
 
+  const onOpenCommit = useCallback(
+    (commit: GitHistoryCommit) => {
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === activeTabId
+            ? openCommitTab(tab, sidebarCwdRef.current, {
+                sha: commit.sha,
+                shortSha: commit.shortSha,
+                subject: commit.subject,
+              })
+            : tab,
+        ),
+      );
+      setComposerFocused(false);
+    },
+    [activeTabId],
+  );
+
   const onShowSourceControl = useCallback(() => {
     setSidebarTab("changes");
   }, []);
@@ -2117,10 +2214,18 @@ export default function App({
   const onReorderTabs = useCallback(
     (ids: string[], movedId?: string) => {
       setTabs((prev) => {
+        const visibleIds = new Set(ids);
+        const visibleTabs = prev.filter((tab) => visibleIds.has(tab.id));
         if (movedId) {
-          return applyGroupedReorder(prev, ids, movedId, projectOfTab) ?? prev;
+          const reordered = applyGroupedReorder(
+            visibleTabs,
+            ids,
+            movedId,
+            projectOfTab,
+          );
+          return reordered ? mergeOrderedSubset(prev, reordered) : prev;
         }
-        return orderByIds(prev, ids);
+        return mergeOrderedSubset(prev, orderByIds(visibleTabs, ids));
       });
     },
     [projectOfTab],
@@ -2980,12 +3085,31 @@ export default function App({
       sessionId: string,
       text: string,
       attachments: Attachment[] = [],
-      options?: { secondOpinion?: SecondOpinionMeta },
+      options?: {
+        secondOpinion?: SecondOpinionMeta;
+        followUpBehavior?: FollowUpBehavior;
+        noteCard?: NoteComposerCard;
+        handoffCard?: HandoffComposerCard;
+        queuedMessageId?: string;
+      },
     ) => {
       const current = sessionsRef.current.find((s) => s.id === sessionId);
       if (!current) return;
-      const noteCard = current.noteCard;
-      const handoffCard = current.handoffCard;
+      if (options?.queuedMessageId) {
+        const mode =
+          options.followUpBehavior === "steer" ? "steer" : "dispatch";
+        if (
+          !queuedMessageForSubmit(current, options.queuedMessageId, mode)
+        ) {
+          return;
+        }
+      }
+      const noteCard =
+        options && "noteCard" in options ? options.noteCard : current.noteCard;
+      const handoffCard =
+        options && "handoffCard" in options
+          ? options.handoffCard
+          : current.handoffCard;
       if (
         !text.trim() &&
         attachments.length === 0 &&
@@ -3004,6 +3128,35 @@ export default function App({
           : null;
 
       if (current.busy && !pendingSwitch) {
+        const followUpBehavior =
+          options?.followUpBehavior ?? loadFollowUpBehavior();
+        if (followUpBehavior === "queue") {
+          setSessions((prev) =>
+            prev.map((s) =>
+              s.id === sessionId
+                ? {
+                    ...s,
+                    inboxCard: undefined,
+                    noteCard: undefined,
+                    handoffCard: undefined,
+                    queuedMessages: [
+                      ...(s.queuedMessages ?? []),
+                      {
+                        id: crypto.randomUUID(),
+                        text,
+                        attachments,
+                        noteCard,
+                        handoffCard,
+                      },
+                    ],
+                    queueStatus:
+                      s.queueStatus === "paused" ? "paused" : "active",
+                  }
+                : s,
+            ),
+          );
+          return;
+        }
         if (
           !isLiveHarness(current.harness) ||
           !canSteerHarness(current.harness)
@@ -3020,21 +3173,19 @@ export default function App({
         const visible = displayAttachments(attachments);
         const cards = userTurnCards(noteCard);
         setSessions((prev) =>
-          prev.map((s) =>
-            s.id === sessionId
-              ? appendSteerUser(
-                  {
-                    ...s,
-                    inboxCard: undefined,
-                    noteCard: undefined,
-                    handoffCard: undefined,
-                  },
-                  text,
-                  visible,
-                  cards,
-                )
-              : s,
-          ),
+          prev.map((s) => {
+            if (s.id !== sessionId) return s;
+            let next: Session = {
+              ...s,
+              inboxCard: undefined,
+              noteCard: undefined,
+              handoffCard: undefined,
+            };
+            if (options?.queuedMessageId) {
+              next = dequeueQueuedMessage(next, options.queuedMessageId);
+            }
+            return appendSteerUser(next, text, visible, cards);
+          }),
         );
         void (async () => {
           try {
@@ -3098,12 +3249,15 @@ export default function App({
         prev.map((s) => {
           if (s.id !== sessionId) return s;
           const titled = isFirstTurn ? titleSeed : s.title;
-          const next = {
+          let next: Session = {
             ...s,
             inboxCard: undefined,
             noteCard: undefined,
             handoffCard: undefined,
           };
+          if (options?.queuedMessageId) {
+            next = dequeueQueuedMessage(next, options.queuedMessageId);
+          }
           if (!live) {
             return {
               ...next,
@@ -3291,13 +3445,11 @@ export default function App({
         } finally {
           if (turnGen.current.get(sessionId) !== gen) return;
           flushHarnessEvents();
+          await flushSessionCheckpoint(sessionId);
           setSessions((prev) =>
             prev.map((s) => (s.id === sessionId ? stopStreaming(s) : s)),
           );
           playCue("turnFinished");
-          await syncSessionCheckpoint(sessionId, workCwd).catch(
-            () => undefined,
-          );
           notifyReviewChanged(sessionId);
           notifyGitChanged();
           nudgeWorkspace(workCwd);
@@ -3307,6 +3459,154 @@ export default function App({
       })();
     },
     [enqueueHarnessEvent, flushHarnessEvents],
+  );
+
+  useEffect(() => {
+    const timers: number[] = [];
+    const scheduled = new Set<string>();
+    for (const session of sessions) {
+      const queued = session.queuedMessages ?? [];
+      if (session.busy || queued.length === 0) continue;
+
+      if (session.queueStatus === "resuming") {
+        setSessions((prev) =>
+          prev.map((entry) =>
+            entry.id === session.id
+              ? { ...entry, queueStatus: "active" }
+              : entry,
+          ),
+        );
+        continue;
+      }
+      if (
+        !canDispatchQueuedHead(session) ||
+        queueDispatchingRef.current.has(session.id)
+      ) {
+        continue;
+      }
+
+      const next = queued[0];
+      if (!next) continue;
+      queueDispatchingRef.current.add(session.id);
+      scheduled.add(session.id);
+      timers.push(
+        window.setTimeout(() => {
+          queueDispatchingRef.current.delete(session.id);
+          const latest = sessionsRef.current.find(
+            (entry) => entry.id === session.id,
+          );
+          const head = latest?.queuedMessages?.[0];
+          if (
+            !latest ||
+            !head ||
+            head.id !== next.id ||
+            !canDispatchQueuedHead(latest)
+          ) {
+            return;
+          }
+          onSubmit(session.id, head.text, head.attachments, {
+            queuedMessageId: head.id,
+            noteCard: head.noteCard,
+            handoffCard: head.handoffCard,
+          });
+        }, 0),
+      );
+    }
+    return () => {
+      for (const timer of timers) window.clearTimeout(timer);
+      for (const id of scheduled) queueDispatchingRef.current.delete(id);
+    };
+  }, [onSubmit, sessions]);
+
+  const onDeleteQueuedMessage = useCallback(
+    (sessionId: string, messageId: string) => {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId
+            ? dequeueQueuedMessage(session, messageId)
+            : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const onQueuedMessageEditingChange = useCallback(
+    (sessionId: string, messageId?: string) => {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId
+            ? { ...session, editingQueuedMessageId: messageId }
+            : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const onEditQueuedMessage = useCallback(
+    (sessionId: string, messageId: string, text: string) => {
+      setSessions((prev) =>
+        prev.map((session) =>
+          session.id === sessionId
+            ? {
+                ...session,
+                queuedMessages: session.queuedMessages?.map((message) =>
+                  message.id === messageId ? { ...message, text } : message,
+                ),
+                editingQueuedMessageId: undefined,
+              }
+            : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const onSteerQueuedMessage = useCallback(
+    (sessionId: string, messageId: string) => {
+      const session = sessionsRef.current.find(
+        (entry) => entry.id === sessionId,
+      );
+      const message = session
+        ? queuedMessageForSubmit(session, messageId, "steer")
+        : undefined;
+      if (!session || !message) return;
+      onSubmit(sessionId, message.text, message.attachments, {
+        followUpBehavior: "steer",
+        queuedMessageId: message.id,
+        noteCard: message.noteCard,
+        handoffCard: message.handoffCard,
+      });
+    },
+    [onSubmit],
+  );
+
+  const onResumeQueue = useCallback(
+    (sessionId: string) => {
+      const session = sessionsRef.current.find(
+        (entry) => entry.id === sessionId,
+      );
+      if (
+        !session ||
+        session.busy ||
+        session.queueStatus !== "paused" ||
+        !session.queuedMessages?.length
+      ) {
+        return;
+      }
+      setSessions((prev) =>
+        prev.map((entry) =>
+          entry.id === sessionId
+            ? { ...entry, queueStatus: "resuming" }
+            : entry,
+        ),
+      );
+      onSubmit(sessionId, CONTINUE_PROMPT, [], {
+        followUpBehavior: "steer",
+      });
+    },
+    [onSubmit],
   );
 
   const openSessionBeside = useCallback(
@@ -3450,15 +3750,16 @@ export default function App({
         prev.map((s) => {
           if (s.id !== sessionId) return s;
           const stopped = stopStreaming(s);
-          return isPreparingHandoff(stopped)
+          const completed = isPreparingHandoff(stopped)
             ? completeHandoff(stopped, buildDeterministicHandoff(stopped))
             : stopped;
+          return completed.queuedMessages?.length
+            ? { ...completed, queueStatus: "paused" }
+            : completed;
         }),
       );
       if (session) {
-        void syncSessionCheckpoint(sessionId, sessionWorkCwd(session))
-          .catch(() => undefined)
-          .then(() => notifyReviewChanged(sessionId));
+        notifyReviewChanged(sessionId);
         nudgeWorkspace(sessionWorkCwd(session));
         notifyGitChanged();
         nudgeWatchedFiles();
@@ -3782,6 +4083,7 @@ export default function App({
 
   const actions = useRef({
     onNew,
+    onCloseOtherTabs,
     onClosePane,
     onNext,
     onPrev,
@@ -3804,6 +4106,7 @@ export default function App({
   });
   actions.current = {
     onNew,
+    onCloseOtherTabs,
     onClosePane,
     onNext,
     onPrev,
@@ -3867,6 +4170,8 @@ export default function App({
         e.stopPropagation();
         const a = actions.current;
         if (cmd === "new") run("new", a.onNew);
+        else if (cmd === "close-others")
+          run("close-others", a.onCloseOtherTabs);
         else if (cmd === "close") run("close", a.onClosePane);
         else if (cmd === "next") run("next", a.onNext);
         else if (cmd === "prev") run("prev", a.onPrev);
@@ -3932,6 +4237,9 @@ export default function App({
   useEffect(() => {
     const unlisten: Array<Promise<() => void>> = [
       listen("new_tab", () => run("new", actions.current.onNew)),
+      listen("close_other_tabs", () =>
+        run("close-others", actions.current.onCloseOtherTabs),
+      ),
       listen("close_tab", () => run("close", actions.current.onClosePane)),
       listen("next_tab", () => run("next", actions.current.onNext)),
       listen("prev_tab", () => run("prev", actions.current.onPrev)),
@@ -4062,10 +4370,12 @@ export default function App({
         onGoBack={onRailBack}
         onGoForward={onRailForward}
         onOpenDiff={onOpenDiff}
+        onOpenCommit={onOpenCommit}
         onShowSourceControl={onToggleChanges}
         selectedDiffPath={
           activeTab ? selectedChangePath(activeTab, gitCwd) : undefined
         }
+        selectedCommitSha={activeTab ? selectedCommitSha(activeTab) : undefined}
         textHarness={pickTextHarness(active?.harness)}
         recents={recents}
         busyProjectPaths={sessions.flatMap((session) =>
@@ -4123,6 +4433,7 @@ export default function App({
             onCloseCurrentTab={
               activeTabId ? () => onCloseTab(activeTabId) : undefined
             }
+            onCloseOtherTabs={onCloseOtherTabs}
             onPickProject={pickProject}
             onFindInProject={onFindInProject}
             onSearch={onOpenSearch}
@@ -4247,6 +4558,13 @@ export default function App({
                       onRuntimeModeChange={onRuntimeModeChange}
                       onSubmit={onSubmit}
                       onStop={onStop}
+                      onDeleteQueuedMessage={onDeleteQueuedMessage}
+                      onEditQueuedMessage={onEditQueuedMessage}
+                      onQueuedMessageEditingChange={
+                        onQueuedMessageEditingChange
+                      }
+                      onSteerQueuedMessage={onSteerQueuedMessage}
+                      onResumeQueue={onResumeQueue}
                       onInboxCardDismiss={onInboxCardDismiss}
                       onNoteCardDismiss={onNoteCardDismiss}
                       onHandoffCardDismiss={onHandoffCardDismiss}
@@ -4381,6 +4699,15 @@ function selectedChangePath(
   const file = focusedFileTab(tab);
   if (!file || !isFilesystemTab(file) || !file.review) return undefined;
   return displayPath(file.path, gitCwd || file.cwd);
+}
+
+function selectedCommitSha(tab: WorkspaceTab): string | undefined {
+  const focused = focusedFileTab(tab);
+  if (focused && isCommitTab(focused)) return focused.commit.sha;
+  for (const pane of tab.editorPanes) {
+    const file = pane.files.find((entry) => entry.id === pane.activeFileId);
+    if (file && isCommitTab(file)) return file.commit.sha;
+  }
 }
 
 function isBlankWorkspaceTab(tab: WorkspaceTab, sessions: Session[]): boolean {
@@ -4542,25 +4869,25 @@ function trackSessionEdits(
   cwd: string,
   event: HarnessEvent,
 ) {
-  if (event.type !== "tool.updated") return;
-  const completed = event.status === "completed" || event.status === "success";
-  if (!completed) return;
-  const kind = event.kind?.trim().toLowerCase();
-  if (kind === "execute" || event.preview?.kind === "shell") {
-    void syncSessionCheckpoint(sessionId, cwd)
-      .catch(() => undefined)
-      .then(() => notifyReviewChanged(sessionId));
-    return;
-  }
+  if (event.type !== "tool.started" && event.type !== "tool.updated") return;
   if (!isEditTool(event.kind, event.title, event.preview)) return;
-  const path = event.preview?.path;
-  if (path && cwd !== "~") {
-    void captureSessionCheckpoint(sessionId, cwd, [path])
-      .catch(() => undefined)
-      .then(() => notifyReviewChanged(sessionId));
+  const paths = [
+    ...(event.paths ?? []),
+    ...(event.preview?.path ? [event.preview.path] : []),
+  ].filter((path, index, all) => all.indexOf(path) === index);
+  if (paths.length === 0 || cwd === "~") return;
+  const completed =
+    event.type === "tool.updated" &&
+    (event.status === "completed" || event.status === "success");
+  if (!completed) {
+    void prepareSessionCheckpoint(sessionId, cwd, paths).catch(
+      () => undefined,
+    );
     return;
   }
-  notifyReviewChanged(sessionId);
+  void captureSessionCheckpoint(sessionId, cwd, paths)
+    .catch(() => undefined)
+    .then(() => notifyReviewChanged(sessionId));
 }
 
 function nudgeWorkspace(cwd?: string) {

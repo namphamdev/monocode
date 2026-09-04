@@ -33,6 +33,7 @@ import {
 
 type Props = {
   session: Session;
+  reviewUndoLocked?: boolean;
   visible: boolean;
   focused: boolean;
   inSplit: boolean;
@@ -55,6 +56,18 @@ type Props = {
     attachments: Attachment[],
   ) => void;
   onStop: (sessionId: string) => void;
+  onDeleteQueuedMessage: (sessionId: string, messageId: string) => void;
+  onEditQueuedMessage: (
+    sessionId: string,
+    messageId: string,
+    text: string,
+  ) => void;
+  onQueuedMessageEditingChange: (
+    sessionId: string,
+    messageId?: string,
+  ) => void;
+  onSteerQueuedMessage: (sessionId: string, messageId: string) => void;
+  onResumeQueue: (sessionId: string) => void;
   onInboxCardDismiss?: (sessionId: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
   onHandoffCardDismiss?: (sessionId: string) => void;
@@ -69,7 +82,10 @@ type Props = {
     reply: UserQuestionReply,
   ) => void;
   onOpenFile: (path: string) => void;
-  onOpenDiff: (path?: string) => void;
+  onOpenDiff: (
+    path?: string,
+    session?: { sessionId: string; cwd: string },
+  ) => void;
   onOpenPlan: (sessionId: string, blockId: string) => void;
   onSecondOpinion?: (
     sessionId: string,
@@ -89,6 +105,7 @@ type Props = {
 
 export const SessionPane = memo(function SessionPane({
   session,
+  reviewUndoLocked = false,
   visible,
   focused,
   inSplit,
@@ -104,6 +121,11 @@ export const SessionPane = memo(function SessionPane({
   onRuntimeModeChange,
   onSubmit,
   onStop,
+  onDeleteQueuedMessage,
+  onEditQueuedMessage,
+  onQueuedMessageEditingChange,
+  onSteerQueuedMessage,
+  onResumeQueue,
   onInboxCardDismiss,
   onNoteCardDismiss,
   onHandoffCardDismiss,
@@ -224,6 +246,21 @@ export const SessionPane = memo(function SessionPane({
       onRuntimeModeChange={(mode) => onRuntimeModeChange(session.id, mode)}
       onSubmit={(text, attachments) => onSubmit(session.id, text, attachments)}
       onStop={() => onStop(session.id)}
+      queuedMessages={session.queuedMessages}
+      queueStatus={session.queueStatus}
+      onDeleteQueuedMessage={(messageId) =>
+        onDeleteQueuedMessage(session.id, messageId)
+      }
+      onEditQueuedMessage={(messageId, text) =>
+        onEditQueuedMessage(session.id, messageId, text)
+      }
+      onQueuedMessageEditingChange={(messageId) =>
+        onQueuedMessageEditingChange(session.id, messageId)
+      }
+      onSteerQueuedMessage={(messageId) =>
+        onSteerQueuedMessage(session.id, messageId)
+      }
+      onResumeQueue={() => onResumeQueue(session.id)}
       onOpenFile={onOpenFile}
       busy={!!session.busy}
     >
@@ -232,6 +269,7 @@ export const SessionPane = memo(function SessionPane({
         cwd={workCwd}
         enabled={visible}
         busy={!!session.busy}
+        undoLocked={reviewUndoLocked}
         onOpenDiff={onOpenDiff}
       />
     </Composer>
@@ -304,6 +342,7 @@ export const SessionPane = memo(function SessionPane({
               visible={visible}
               cwd={workCwd}
               harness={session.harness}
+              model={session.model}
               pendingQuestion={!!session.pendingQuestion}
               onApproval={approve}
               onAddToChat={addSelectionToChat}

@@ -7,21 +7,27 @@ import {
 import { SurfaceTabs } from "../chrome/SurfaceTabs";
 import {
   isChangesTab,
+  isCommitTab,
   isPlanTab,
   isReleaseNotesTab,
   isReviewTab,
+  isSessionChangesTab,
   isTerminalTab,
   type EditorPane,
   type FilePaneTab,
 } from "../lib/layout";
+import { isImagePath } from "../lib/filePreview";
 import type { TerminalMetaPatch } from "../lib/terminalTab";
 import type { EditorNavigationTarget } from "../lib/search";
 import { editorPathsEqual } from "../lib/search";
 import type { Session } from "../lib/session";
 import { loadDiffViewer, subscribeDiffViewer } from "../lib/settings";
 import { MarkdownPreview, MarkdownSource } from "./AgentMarkdown";
+import { BinaryFileView } from "./BinaryFileView";
+import { CommitDiff } from "./CommitDiff";
 import { FileEditor } from "./FileEditor";
 import { ReleaseNotesSurface } from "./ReleaseNotesSurface";
+import { SessionChangesDiff } from "./SessionChangesDiff";
 import { TerminalView } from "./TerminalView";
 import { WorkingTreeDiff } from "./WorkingTreeDiff";
 
@@ -66,10 +72,14 @@ function FilePaneComponent({
     loadDiffViewer,
   );
   const activeFile = pane.files.find((file) => file.id === pane.activeFileId);
+  const sessionReview =
+    activeFile && isSessionChangesTab(activeFile) ? activeFile : undefined;
   const unifiedReview =
     !!activeFile &&
+    !sessionReview &&
     (isChangesTab(activeFile) ||
       (diffViewer === "unified" && isReviewTab(activeFile)));
+  const commitReview = !!activeFile && isCommitTab(activeFile);
 
   return (
     <div
@@ -87,13 +97,30 @@ function FilePaneComponent({
         onPaneDragStart={onPaneDragStart}
       />
       <div className="relative min-h-0 flex-1">
-        {unifiedReview && activeFile ? (
+        {sessionReview ? (
+          <div className="absolute inset-0 h-full">
+            <SessionChangesDiff
+              cwd={sessionReview.cwd}
+              sessionId={sessionReview.sessionChanges.sessionId}
+              focusPath={sessionReview.path}
+            />
+          </div>
+        ) : commitReview && activeFile?.commit ? (
+          <div className="absolute inset-0 h-full">
+            <CommitDiff cwd={activeFile.cwd} sha={activeFile.commit.sha} />
+          </div>
+        ) : unifiedReview && activeFile ? (
           <div className="absolute inset-0 h-full">
             <WorkingTreeDiff cwd={activeFile.cwd} focusPath={activeFile.path} />
           </div>
         ) : null}
         {pane.files.map((file) => {
-          if ((unifiedReview && isReviewTab(file)) || isChangesTab(file))
+          if (
+            isCommitTab(file) ||
+            isChangesTab(file) ||
+            isSessionChangesTab(file) ||
+            (unifiedReview && isReviewTab(file))
+          )
             return null;
           return (
             <div
@@ -122,6 +149,8 @@ function FilePaneComponent({
                     onTerminalMetaChange?.(file.id, patch)
                   }
                 />
+              ) : isImagePath(file.path) ? (
+                <BinaryFileView path={file.path} cwd={file.cwd} />
               ) : (
                 <FileEditor
                   path={file.path}

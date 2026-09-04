@@ -8,7 +8,6 @@ import {
   Bot,
   PenLine,
   Search,
-  Sparkles,
   Terminal,
   Wrench,
   X,
@@ -26,7 +25,11 @@ import { AttachmentChip } from "../chrome/AttachmentChip";
 import { FilePreview } from "../chrome/FilePreview";
 import { FileTypeIcon } from "../chrome/FileTypeIcon";
 import { PlanPreview } from "../chrome/PlanPreview";
-import { HandoffButton, SecondOpinionButton } from "../chrome/SecondOpinionButton";
+import { TaskListPreview } from "../chrome/TaskListPreview";
+import {
+  HandoffButton,
+  SecondOpinionButton,
+} from "../chrome/SecondOpinionButton";
 import { SecondOpinionCard } from "../chrome/SecondOpinionCard";
 import { NoteMiniCard } from "../chrome/NoteMiniCard";
 import { TerminalSpinner } from "../chrome/TerminalSpinner";
@@ -39,7 +42,9 @@ import {
 } from "../lib/harness/preview";
 import { copyText } from "../lib/clipboard";
 import { playCue } from "../lib/sounds";
+import { legacyTaskListFromText } from "../lib/taskList";
 import { displayPath, resolveWorkspacePath } from "../lib/paths";
+import { resolveModel } from "../lib/models";
 import { harnessForTurn } from "../lib/secondOpinion";
 import { Shimmer } from "./Shimmer";
 import {
@@ -65,6 +70,7 @@ import {
   groupTurnItems,
   groupTurns,
   hasRunningSubagent,
+  initialThinkingIndex,
   isIncompleteTool,
   isThinkingBlock,
   lastActivityIndex,
@@ -89,6 +95,7 @@ type Props = {
   busy?: boolean;
   cwd?: string;
   harness?: HarnessId;
+  model?: string;
   pendingQuestion?: boolean;
   onApproval?: (requestId: number, decision: ApprovalDecision) => void;
   onAddToChat?: (text: string) => void;
@@ -109,6 +116,7 @@ export function AgentTranscript({
   busy,
   cwd,
   harness,
+  model,
   pendingQuestion = false,
   onApproval,
   onAddToChat,
@@ -148,6 +156,7 @@ export function AgentTranscript({
     if (lastUserId && !anchorTurn) setAnchorTurn(true);
   }
   const liveStartedAt = turnUserBlock(blocks)?.startedAt;
+  const modelName = harness ? resolveModel(harness, model).name : undefined;
   const waitingForApproval = hasPendingApproval(blocks) || pendingQuestion;
   const preparingHandoff = blocks.some(
     (block) =>
@@ -313,9 +322,10 @@ export function AgentTranscript({
           const durationMs = userBlock?.durationMs;
           const settled = !(busy && isLastTurn);
           const items = groupTurnItems(turn);
-          // Where the work ends and the answer begins: the last group of
-          // activity in the turn.
+          // Earlier activity groups have already been followed by prose or
+          // more work. Only the last one can still be the live group.
           const foldedAt = lastActivityIndex(items);
+          const initialThinkingAt = initialThinkingIndex(items);
           const startedAt = userBlock?.startedAt;
           // The agent starting its answer is the end of the work: fold the
           // groups then, not when the turn finally settles, so the collapse
@@ -328,6 +338,9 @@ export function AgentTranscript({
                 (item) => item.type === "block" && isProseBlock(item.block),
               );
           const workStillRunning = activityStillRunning(turn);
+          const turnHarness = harness
+            ? harnessForTurn(blocks, turn, harness)
+            : undefined;
           return (
             <div
               key={turn[0].id}
@@ -341,24 +354,35 @@ export function AgentTranscript({
             >
               {items.map((item, itemIndex) =>
                 item.type === "activity" ? (
+                  itemIndex === initialThinkingAt ? (
+                    <InitialThinking
+                      key={item.blocks[0].id}
+                      live={!settled}
+                    />
+                  ) : (
                     <ActivityPhases
                       key={item.blocks[0].id}
                       blocks={item.blocks}
                       cwd={cwd}
-                      done={settled || (answering && !workStillRunning)}
+                      done={
+                        settled ||
+                        itemIndex < foldedAt ||
+                        (answering && !workStillRunning)
+                      }
                       onApproval={onApproval}
                       onOpenFile={onOpenFile}
                       onOpenDiff={onOpenDiff}
                     />
+                  )
                 ) : (
                   <TranscriptBlock
                     key={item.block.id}
                     block={item.block}
                     layout={transcriptLayout}
                     stickyIndex={firstVisibleTurn + turnIndex + 1}
-                    compactTop={
-                      foldedAt >= 0 &&
-                      itemIndex === foldedAt + 1 &&
+                    afterActivity={
+                      itemIndex > 0 &&
+                      items[itemIndex - 1]?.type === "activity" &&
                       isProseBlock(item.block)
                     }
                     onApproval={onApproval}
@@ -373,14 +397,14 @@ export function AgentTranscript({
                 <TurnDuration
                   elapsedMs={durationMs}
                   done
+                  modelName={modelName}
                   completedAt={
                     startedAt != null ? startedAt + durationMs : undefined
                   }
                   copyText={turnCopyText(turn)}
                   onSaveNote={onSaveNote}
-                  fromHarness={
-                    harness ? harnessForTurn(blocks, turn, harness) : undefined
-                  }
+                  harness={turnHarness}
+                  fromHarness={turnHarness}
                   onSecondOpinion={
                     onSecondOpinion
                       ? (target, model) => onSecondOpinion(target, turn, model)
@@ -401,6 +425,8 @@ export function AgentTranscript({
                     pendingQuestion ? "Waiting for answers" : undefined
                   }
                   subagent={hasRunningSubagent(turn)}
+                  modelName={modelName}
+                  harness={turnHarness}
                 />
               ) : null}
             </div>
@@ -418,16 +444,29 @@ export function AgentTranscript({
   );
 }
 
+/** Placeholder for private reasoning before the first assistant text arrives. */
+function InitialThinking({ live }: { live: boolean }) {
+  return (
+    <div className="min-w-0 px-4 py-1 font-sans text-sm text-content/50">
+      {live ? <Shimmer duration={1.6}>Thinking…</Shimmer> : "Thinking…"}
+    </div>
+  );
+}
+
 function LiveWorking({
   startedAt,
   paused,
   waitingLabel,
   subagent = false,
+  modelName,
+  harness,
 }: {
   startedAt?: number;
   paused: boolean;
   waitingLabel?: string;
   subagent?: boolean;
+  modelName?: string;
+  harness?: HarnessId;
 }) {
   const elapsedMs = useElapsedFrom(startedAt, paused);
   return (
@@ -437,6 +476,8 @@ function LiveWorking({
       waiting={paused}
       waitingLabel={waitingLabel}
       subagent={subagent}
+      modelName={modelName}
+      harness={harness}
     />
   );
 }
@@ -448,6 +489,8 @@ function TurnDuration({
   waiting = false,
   waitingLabel,
   subagent = false,
+  modelName,
+  harness,
   completedAt,
   copyText: output,
   onSaveNote,
@@ -461,6 +504,8 @@ function TurnDuration({
   waiting?: boolean;
   waitingLabel?: string;
   subagent?: boolean;
+  modelName?: string;
+  harness?: HarnessId;
   completedAt?: number;
   copyText?: string;
   onSaveNote?: (text: string) => void;
@@ -469,8 +514,8 @@ function TurnDuration({
   onHandoff?: (harness: HarnessId, model: string) => void;
 }) {
   const label = waiting
-    ? waitingLabel ?? "Waiting for approval"
-    : formatWorkingDuration(elapsedMs, done, subagent);
+    ? (waitingLabel ?? "Waiting for approval")
+    : formatWorkingDuration(elapsedMs, done, subagent, modelName);
   const dot = (
     <span
       aria-hidden
@@ -486,14 +531,18 @@ function TurnDuration({
           ? label
           : live
             ? subagent
-              ? "Subagent is running"
-              : "Agent is working"
+              ? modelName
+                ? `${modelName} subagent is running`
+                : "Subagent is running"
+              : modelName
+                ? `${modelName} is working`
+                : "Agent is working"
             : label
       }
-      className="flex items-center gap-3 px-4 pt-1 pb-3 font-sans text-sm text-content/40"
+      className="flex min-w-0 items-center gap-2.5 px-4 pt-1 pb-3 font-sans text-sm text-content/40"
     >
       {done ? (
-        <span className="flex items-center gap-2">
+        <span className="flex shrink-0 items-center gap-1">
           {output ? (
             <>
               <CopyTurnButton text={output} />
@@ -517,16 +566,25 @@ function TurnDuration({
 
       {done ? dot : null}
 
-      {live && !done ? (
-        <Shimmer duration={1}>{label}</Shimmer>
-      ) : (
-        <span>{label}</span>
-      )}
+      <span className="flex min-w-0 items-center gap-1.5">
+        {harness ? (
+          <HarnessIcon harness={harness} className="size-3.5 shrink-0" />
+        ) : null}
+        {live && !done ? (
+          <Shimmer duration={1} className="min-w-0 truncate">
+            {label}
+          </Shimmer>
+        ) : (
+          <span className="min-w-0 truncate" title={label}>
+            {label}
+          </span>
+        )}
+      </span>
 
       {completedAt != null ? (
         <>
           {dot}
-          <span className="text-content/35">
+          <span className="shrink-0 text-content/35">
             {formatClockTime(completedAt)}
           </span>
         </>
@@ -625,7 +683,7 @@ const TranscriptBlock = memo(function TranscriptBlock({
   block,
   layout,
   stickyIndex,
-  compactTop = false,
+  afterActivity = false,
   cwd,
   onApproval,
   onOpenFile,
@@ -635,7 +693,7 @@ const TranscriptBlock = memo(function TranscriptBlock({
   block: Block;
   layout: TranscriptLayout;
   stickyIndex: number;
-  compactTop?: boolean;
+  afterActivity?: boolean;
   cwd?: string;
   onApproval?: (requestId: number, decision: ApprovalDecision) => void;
   onOpenFile?: (path: string) => void;
@@ -668,7 +726,27 @@ const TranscriptBlock = memo(function TranscriptBlock({
     return null;
   }
 
+  if (block.role === "tasks") {
+    if (!block.taskList?.items.length) return null;
+    return (
+      <div className="px-4 py-1">
+        <TaskListPreview
+          items={block.taskList.items}
+          explanation={block.taskList.explanation}
+        />
+      </div>
+    );
+  }
+
   if (block.role === "plan") {
+    const legacyTasks = legacyTaskListFromText(block.text);
+    if (legacyTasks) {
+      return (
+        <div className="px-4 py-1">
+          <TaskListPreview items={legacyTasks} />
+        </div>
+      );
+    }
     return (
       <div className="px-4 py-1">
         <PlanPreview
@@ -711,7 +789,7 @@ const TranscriptBlock = memo(function TranscriptBlock({
   return (
     <div
       data-selectable-agent-response={block.streaming ? undefined : block.id}
-      className={`min-w-0 px-4 pb-1 text-content ${compactTop ? "pt-2" : "pt-3"}`}
+      className={`min-w-0 px-4 pb-1 text-content ${afterActivity ? "pt-1" : "pt-3"}`}
     >
       <AgentMarkdown
         text={block.text}
@@ -802,12 +880,10 @@ function UserMessageBlock({
 }
 
 /**
- * The turn's work as phases. A phase is a run of related calls under the line
- * the agent wrote to introduce it — "now I need to find the theme provider",
- * then the searches and reads that followed. The phase the agent is in stays
- * open, with new steps scrolling inside a short window; the moment it moves
- * on the phase folds back to its header, so a long turn ends up as a handful
- * of labelled groups sitting above the answer.
+ * The turn's work as phases. Related reasoning and calls stay together while
+ * assistant prose remains outside as full-size transcript text. The phase the
+ * agent is in stays open, with new steps scrolling inside a short window; the
+ * moment it moves on the phase folds back to its header.
  */
 function ActivityPhases({
   blocks,
@@ -1074,7 +1150,7 @@ function ActivityPhaseIcon({
   if (kind === "research") return <Search {...props} />;
   if (kind === "run") return <Terminal {...props} />;
   if (kind === "agent") return <Bot {...props} />;
-  if (kind === "think") return <Sparkles {...props} />;
+  if (kind === "think") return null;
   if (kind === "other") return <Wrench {...props} />;
   return <Minus {...props} />;
 }
@@ -1403,21 +1479,35 @@ function formatWorkingDuration(
   elapsedMs: number | null,
   done = false,
   subagent = false,
+  modelName?: string,
 ): string {
-  if (elapsedMs == null) {
-    if (done) return "Worked";
-    return subagent ? "Subagent running…" : "Working…";
+  const who = modelName?.trim();
+  const elapsed = formatElapsed(elapsedMs);
+  const verb = workingVerb(done, subagent, !who);
+  if (elapsed == null) {
+    if (done) return who ? `${who} ${verb}` : verb;
+    return who ? `${who} ${verb}…` : `${verb}…`;
   }
+  return who ? `${who} ${verb} for ${elapsed}` : `${verb} for ${elapsed}`;
+}
+
+function workingVerb(
+  done: boolean,
+  subagent: boolean,
+  capitalized: boolean,
+): string {
+  if (done) return capitalized ? "Worked" : "worked";
+  if (subagent) return capitalized ? "Subagent running" : "subagent running";
+  return capitalized ? "Working" : "working";
+}
+
+function formatElapsed(elapsedMs: number | null): string | null {
+  if (elapsedMs == null) return null;
   const totalSec = Math.max(1, Math.round(elapsedMs / 1000));
-  const label = done
-    ? "Worked for"
-    : subagent
-      ? "Subagent running for"
-      : "Working for";
-  if (totalSec < 60) return `${label} ${totalSec}s`;
+  if (totalSec < 60) return `${totalSec}s`;
   const minutes = Math.floor(totalSec / 60);
   const seconds = totalSec % 60;
-  return seconds ? `${label} ${minutes}m ${seconds}s` : `${label} ${minutes}m`;
+  return seconds ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
 function ToolCall({

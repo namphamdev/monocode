@@ -1,4 +1,5 @@
-import type { RuntimeMode, ToolPreview } from "../session";
+import type { RuntimeMode, TaskListItem, ToolPreview } from "../session";
+import { normalizeTaskListStatus } from "../taskList";
 import {
   composeToolTitle,
   extractToolPreview,
@@ -226,17 +227,29 @@ export function mapCodexNotification(
   if (method === "turn/plan/updated") {
     const plan = rec.plan;
     if (!Array.isArray(plan)) return { events: [] };
-    const text = plan
-      .map((step) => {
-        const row = asRecord(step);
-        const status = stringField(row, "status") ?? "pending";
-        const body = stringField(row, "step") ?? "";
-        return `${statusMark(status)} ${body}`.trim();
-      })
-      .filter(Boolean)
-      .join("\n");
-    if (!text) return { events: [] };
-    return { events: [{ type: "plan", text }] };
+    const items = plan.flatMap((step): TaskListItem[] => {
+      const row = asRecord(step);
+      const body = stringField(row, "step") ?? "";
+      if (!body) return [];
+      return [
+        {
+          text: body,
+          status: normalizeTaskListStatus(stringField(row, "status")),
+        },
+      ];
+    });
+    const key = stringField(rec, "turnId");
+    const explanation = stringField(rec, "explanation");
+    return {
+      events: [
+        {
+          type: "tasks.updated",
+          items,
+          ...(key ? { key } : {}),
+          ...(explanation ? { explanation } : {}),
+        },
+      ],
+    };
   }
 
   if (method === "item/started" || method === "item/completed") {
@@ -611,6 +624,9 @@ function mapFileChangeItem(
   completed: boolean,
 ): HarnessEvent {
   const changes = Array.isArray(item.changes) ? item.changes : [];
+  const paths = changes
+    .map((change) => stringField(asRecord(change), "path"))
+    .filter((path): path is string => Boolean(path));
   const first = asRecord(changes[0]);
   const path = stringField(first, "path");
   const diff = stringField(first, "diff");
@@ -631,6 +647,7 @@ function mapFileChangeItem(
       kind: "edit",
       status,
       preview,
+      ...(paths.length ? { paths } : {}),
     };
   }
   return {
@@ -640,6 +657,7 @@ function mapFileChangeItem(
     kind: "edit",
     status,
     preview,
+    ...(paths.length ? { paths } : {}),
   };
 }
 
@@ -649,6 +667,9 @@ function mapFileChangePatch(
   const itemId = stringField(rec, "itemId") ?? "";
   if (!itemId) return { events: [] };
   const changes = Array.isArray(rec.changes) ? rec.changes : [];
+  const paths = changes
+    .map((change) => stringField(asRecord(change), "path"))
+    .filter((path): path is string => Boolean(path));
   const first = asRecord(changes[0]);
   const path = stringField(first, "path");
   const diff = stringField(first, "diff") ?? stringField(rec, "diff");
@@ -669,6 +690,7 @@ function mapFileChangePatch(
         kind: "edit",
         status: "in_progress",
         preview,
+        ...(paths.length ? { paths } : {}),
       },
     ],
   };
@@ -706,13 +728,6 @@ function mapItemStatus(
   }
   if (status === "inProgress") return "in_progress";
   return completed ? "completed" : "in_progress";
-}
-
-function statusMark(status: string): string {
-  if (status === "completed") return "[x]";
-  if (status === "inProgress" || status === "in_progress") return "[…]";
-  if (status === "cancelled") return "[-]";
-  return "[ ]";
 }
 
 export function mapApprovalRequest(

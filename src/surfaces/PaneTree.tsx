@@ -22,14 +22,15 @@ import {
   type LayoutSash,
   type PaneEdge,
 } from "../lib/layout";
-import type { RecentProject } from "../lib/recents";
+import { sameProjectPath, type RecentProject } from "../lib/recents";
 import type { TerminalMetaPatch } from "../lib/terminalTab";
-import type {
-  Attachment,
-  Block,
-  HarnessId,
-  RuntimeMode,
-  Session,
+import {
+  sessionWorkCwd,
+  type Attachment,
+  type Block,
+  type HarnessId,
+  type RuntimeMode,
+  type Session,
 } from "../lib/session";
 import { FilePane } from "./FilePane";
 import { SessionPane } from "./SessionPane";
@@ -66,6 +67,18 @@ type Shared = {
     attachments: Attachment[],
   ) => void;
   onStop: (sessionId: string) => void;
+  onDeleteQueuedMessage: (sessionId: string, messageId: string) => void;
+  onEditQueuedMessage: (
+    sessionId: string,
+    messageId: string,
+    text: string,
+  ) => void;
+  onQueuedMessageEditingChange: (
+    sessionId: string,
+    messageId?: string,
+  ) => void;
+  onSteerQueuedMessage: (sessionId: string, messageId: string) => void;
+  onResumeQueue: (sessionId: string) => void;
   onInboxCardDismiss?: (sessionId: string) => void;
   onNoteCardDismiss?: (sessionId: string) => void;
   onHandoffCardDismiss?: (sessionId: string) => void;
@@ -81,7 +94,10 @@ type Shared = {
   ) => void;
   onOpenFile: (path: string) => void;
   editorNavigation?: EditorNavigationTarget | null;
-  onOpenDiff: (path?: string) => void;
+  onOpenDiff: (
+    path?: string,
+    session?: { sessionId: string; cwd: string },
+  ) => void;
   onOpenPlan: (sessionId: string, blockId: string) => void;
   onSecondOpinion?: (
     sessionId: string,
@@ -136,6 +152,11 @@ function PaneTreeComponent({
   onRuntimeModeChange,
   onSubmit,
   onStop,
+  onDeleteQueuedMessage,
+  onEditQueuedMessage,
+  onQueuedMessageEditingChange,
+  onSteerQueuedMessage,
+  onResumeQueue,
   onInboxCardDismiss,
   onNoteCardDismiss,
   onHandoffCardDismiss,
@@ -306,6 +327,15 @@ function PaneTreeComponent({
             ) : session ? (
               <SessionPane
                 session={session}
+                reviewUndoLocked={sessions.some(
+                  (other) =>
+                    other.id !== session.id &&
+                    other.busy &&
+                    sameProjectPath(
+                      sessionWorkCwd(other),
+                      sessionWorkCwd(session),
+                    ),
+                )}
                 visible={visible}
                 focused={focusedId === session.id}
                 inSplit={inSplit}
@@ -321,6 +351,11 @@ function PaneTreeComponent({
                 onRuntimeModeChange={onRuntimeModeChange}
                 onSubmit={onSubmit}
                 onStop={onStop}
+                onDeleteQueuedMessage={onDeleteQueuedMessage}
+                onEditQueuedMessage={onEditQueuedMessage}
+                onQueuedMessageEditingChange={onQueuedMessageEditingChange}
+                onSteerQueuedMessage={onSteerQueuedMessage}
+                onResumeQueue={onResumeQueue}
                 onInboxCardDismiss={onInboxCardDismiss}
                 onNoteCardDismiss={onNoteCardDismiss}
                 onHandoffCardDismiss={onHandoffCardDismiss}
